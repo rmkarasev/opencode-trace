@@ -162,7 +162,7 @@ function delta(prev: unknown, next: unknown): [unknown, boolean] {
           .map(k => [k, sort((v as Record<string, unknown>)[k])]),
       );
     };
-    return createHash("blake2b512").update(JSON.stringify(sort(v))).digest("hex")
+    return createHash("sha256").update(JSON.stringify(sort(v))).digest("hex")
   };
   if (isRecord(prev) && isRecord(next)) {
     // RECORDS: Overall resulting record is just {"[repeat]":"[repeat]"} if it's unchanged. This is the only case
