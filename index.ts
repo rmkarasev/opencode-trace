@@ -328,7 +328,7 @@ function openaiResponses(list: Array<{ data: unknown }>): Record<string, unknown
     if (row.data.type === "response.output_item.added" && isRecord(row.data.item) && typeof row.data.item.id === "string") {
       const id = row.data.item.id
       const item = { ...row.data.item }
-      if (item.type === "message") item.content = (items.get(id)?.content as unknown[]) ?? []
+      if (item.type === "message") item.content = items.get(id)?.content ?? []
       if (!ids.includes(id)) ids.push(id)
       items.set(id, item)
       continue
