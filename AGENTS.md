@@ -13,4 +13,4 @@ This is an OpenCode V2 plugin designed to capture the raw json requests sent to 
 Then each time you edit:
 - `npm run typecheck`
 - `npm run lint`
-- Exercise it `opencode run --model opencode/big-pickle "Short question: what your model name?"`
+- Exercise it `opencode run --standalone --model opencode/big-pickle "Reply exactly with OK"`

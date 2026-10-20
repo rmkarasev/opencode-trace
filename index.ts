@@ -134,7 +134,7 @@ function extractPromptFromRequestBody(v: Record<string, unknown>): string | unde
 
 /**
  * Appends one row to the session logfile. If logging fails, them skips silently.
- * Session logfiles are like `~/opencode-trace/2024.6.10 15.30.45 why is the sky blue.html`
+ * Session logfiles are like `~/opencode-trace/2024-06-10 153045 why is the sky blue.html`
  * In the vanishingly rare case of filename collision (because a user asked two different sessions
  * the same prompt at the exact same second) then there'll be a clash, and that's the user's fault:
  * we tradeoff theoretical perfection for user convenience in the common case.
@@ -143,10 +143,9 @@ function writeNoThrow(id: string, name: string, row: Record<string, unknown>): v
   try {
     const prev = files.get(id)
     const d = new Date()
-    const file = prev ?? path.join(
-      root,
-      `${d.getFullYear()}.${d.getMonth() + 1}.${d.getDate()} ${d.getHours()}.${d.getMinutes()}.${d.getSeconds()} ${name}.html`,
-    )
+    const pad = (n: number, width = 2): string => String(n).padStart(width, "0")
+    const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+    const file = prev ?? path.join(root, `${stamp} ${name}.html`)
     mkdirSync(root, { recursive: true })
     if (!existsSync(file)) {
       const html = PREAMBLE.replace(
