@@ -1,10 +1,10 @@
 /**
- * OpenCode server plugin which captures raw LLM HTTP payloads to `~/opencode-trace`.
+ * OpenCode V2 plugin which captures raw LLM HTTP payloads to `~/opencode-trace`.
  *
  * Each trace is an interactive html file whose trailing unterminated html-comment contains
  * one json object per line. To read the logs programmatically, strip everything up to that
-  * final comment. To browse them interactively, open the html file directly in a browser.
-  *
+ * final comment. To browse them interactively, open the html file directly in a browser.
+ *
  * The plugin loads `./viewer.js` at runtime and embeds it into each new html trace, while also
  * preferring a sibling `viewer.js` if one exists next to the saved html file.
  */
@@ -12,6 +12,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs"
 import { createHash } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
+import { Plugin } from "@opencode/plugin"
 
 const root = path.join(os.homedir(), "opencode-trace")
 const PREAMBLE = `<!DOCTYPE html>
@@ -44,14 +45,45 @@ ${"<!" + "--"}
 /** Mutable global state: maps OpenCode session ids to the html logfile path for that session. */
 const files = new Map<string, string>()
 
-/** Mutable global state: maps `session\nmethod\nurl\n_kind\nmeta|real` to the previous raw body used as the delta base. */
+/** Mutable global state: maps `session\nflow\nmethod\nurl\nrequest|response\npurpose` to the previous raw body used as the delta base. */
 const prevs = new Map<string, object>()
 
-/** Mutable global state: maps OpenCode session ids to the next per-session fetch sequence number. */
+/** Mutable global state: maps OpenCode session ids to the next per-session request sequence number. */
 const ids = new Map<string, number>()
 
-/** Mutable module state: the unpatched global fetch for this module instance, assigned inside `server()`. */
-let orig: typeof globalThis.fetch | undefined
+/** Request flows OpenCode reports through its session hooks. */
+type RequestKind = "primary" | "compaction" | "title" | "generate"
+
+/** The subset of OpenCode's `http.request` hook event that this plugin uses. */
+interface TraceRequestEvent {
+  readonly sessionID: string
+  readonly agent: string
+  readonly model: { readonly providerID: string; readonly id: string; readonly variant?: string | undefined }
+  readonly kind: RequestKind
+  readonly request: Request
+}
+
+/** The subset of OpenCode's `http.response` hook event that this plugin uses. */
+interface TraceResponseEvent extends TraceRequestEvent {
+  readonly response: Response
+}
+
+/** State remembered from `http.request` so `http.response` can reuse the same `_id` and file. */
+interface PendingRequest {
+  id: number
+  sessionID: string
+  kind: RequestKind
+  method: string
+  url: string
+  purpose: string
+  name: string
+}
+
+/** Pairs a request with its response when OpenCode passes the same Request instance to both hooks. */
+const pendingRequests = new WeakMap<Request, PendingRequest>()
+
+/** Fallback pairing when the response hook receives a different Request instance, keyed by session/kind/method/url. */
+const pendingQueues = new Map<string, PendingRequest[]>()
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v)
@@ -519,125 +551,223 @@ function responseAsJson(text: string, url: string): Record<string, unknown> {
   }
 }
 
-/**
- * Intercepts matching OpenCode LLM fetches and logs request/response rows.
- * Side effects: mutates `prevs`, mutates `ids`, and writes logs to disk.
- */
-async function tracedFetch(
-  input: Parameters<typeof globalThis.fetch>[0],
-  init?: Parameters<typeof globalThis.fetch>[1],
-): Promise<Response> {
-  const now = (): string => new Date().toISOString()
-  const error = (err: unknown): { _error: string; _stack?: string } =>
-    err instanceof Error
-      ? err.stack === undefined
-        ? { _error: err.message }
-        : { _error: err.message, _stack: err.stack }
-      : { _error: String(err) }
+function timestamp(): string {
+  return new Date().toISOString()
+}
 
-  const req = new Request(input, init)
-  const session = req.headers.get("x-opencode-session") ?? req.headers.get("x-session-affinity") ?? req.headers.get("session_id") ?? undefined;
-  if (session === undefined) return orig!(req);
+function errorRow(err: unknown): { _error: string; _stack?: string } {
+  return err instanceof Error
+    ? err.stack === undefined
+      ? { _error: err.message }
+      : { _error: err.message, _stack: err.stack }
+    : { _error: String(err) }
+}
 
-  const text = await req.clone().text().catch(() => "")
-  const raw = ((): Record<string, unknown> => {
-    try {
-      const body = JSON.parse(text) as unknown
-      return isRecord(body) ? body : { _body: text }
-    } catch {
-      return { _body: text }
-    }
-  })()
-  const title = isRecord(raw) && typeof raw._body !== "string" ? extractPromptFromRequestBody(raw) : undefined
-  const purpose = isRecord(raw) && Array.isArray(raw.tools) && raw.tools.length > 0 ? '' : '[meta]';
-  // The purpose field is "[meta]" for LLM requests that appear to be not part of the conversation, e.g. "generate a title".
-  // I tried a bunch of heuristics, and this one "no tools" was the one that worked best across a variety of models.
-  // We calculate it here based on the request, and store it on both request and response, since otherwise
-  // there are no reliable indicators on the response jsonl for our viewer to key off.
-  const seq = (ids.get(session) ?? 0) + 1
-  ids.set(session, seq)
-  const common = { _id: seq, _purpose: purpose, _url: req.url }
-  const name = (title ?? session ?? '')
+/** Turns a prompt or session id into a short, filesystem-friendly trace filename. */
+function fileName(title: string | undefined, session: string): string {
+  return (title ?? session)
     .replace(/[^A-Za-z0-9 _-]+/g, " ")
     .trim()
     .split(/\s+/)
     .slice(0, 10)
     .join(" ")
     .slice(0, 50)
-    .trim() || "session";
-  const requestKey = `${session}\n${req.method}\n${req.url}\nrequest\n${purpose}`
-  const requestNext = raw as object
-  const [requestRow] = delta(prevs.get(requestKey), requestNext)
-  prevs.set(requestKey, requestNext)
-  writeNoThrow(session, name, {
-    ...(requestRow as Record<string, unknown>),
-    ...common,
-    _kind: "request",
-    _ts: now(),
-  })
-
-  const res = await orig!(req).catch((err) => {
-    writeNoThrow(session, name, {
-      ...common,
-      _kind: "error",
-      _ts: now(),
-      ...error(err),
-    })
-    throw err
-  });
-  // We'll register background processing of the response, once it comes. But return 'res' immediately.
-  void res
-    .clone()
-    .text()
-    .then((body) => {
-      const json = responseAsJson(body, req.url)
-      const detail = isRecord(json) && isRecord(json.error) && typeof json.error.message === "string"
-        ? json.error.message
-        : isRecord(json) && typeof json.error === "string"
-          ? json.error
-          : `${res.status} ${res.statusText}`
-      const responseNext = (!res.ok
-        ? { ...json, _status: res.status, _status_text: res.statusText, _error: detail }
-        : json) as object
-      const responseKey = `${session}\n${req.method}\n${req.url}\nresponse\n${purpose}`
-      const [responseRow] = delta(prevs.get(responseKey), responseNext)
-      prevs.set(responseKey, responseNext)
-      writeNoThrow(session, name, {
-        ...(responseRow as Record<string, unknown>),
-        ...common,
-        _kind: "response",
-        _ts: now(),
-      })
-    })
-    .catch((err) => {
-      writeNoThrow(session, name, {
-        ...common,
-        _kind: "error",
-        _ts: now(),
-        ...error(err),
-      })
-    })
-  return res
+    .trim() || "session"
 }
 
-/* Plugin model:
- * - This module is loaded with dynamic import() when plugin state is initialized for an instance/directory.
- *   The module import is normally cached, so our top-level state like `orig` survives repeated hook initialization
- * - Opencode calls `default.server()` when it initializes this plugin's server hooks for that instance.
- *   This can happen more than once per process across instance reload/dispose, which is why our fetch()
- *   patch is guarded even though the module itself is loaded only once.
- * - Opencode v1.3 has a single unified process for both TUI and server, so its plugin entrypoint `default` is just a function.
- * - Opencode v1.4 has two separate entrypoints, `default.tui()` and `default.server()`
- */
-const main: (() => Promise<object>) & {id?: unknown, server?: unknown} = async () => {
-  if (!orig) {
-    orig = globalThis.fetch.bind(globalThis);
-    globalThis.fetch = tracedFetch;
-  }
-  return {};
-};
+function modelLabel(model: { readonly providerID: string; readonly id: string; readonly variant?: string | undefined }): string {
+  return `${model.providerID}/${model.id}${model.variant === undefined ? "" : `#${model.variant}`}`
+}
 
-const entrypoint = main; // opencode v1.3 expects default export to be a function
-entrypoint.id = "ljw1004.opencode-trace";
-entrypoint.server = main; // opencode v1.4 expects default export to be an object, with server() being what executes
-export default entrypoint;
+/**
+ * `_purpose` is "" for the agent loop and "[meta]" for auxiliary requests such as title generation,
+ * compaction and `ctx.session.generate`. The viewer uses it to decide which rows to expand.
+ */
+function purposeFor(kind: RequestKind): string {
+  return kind === "primary" ? "" : "[meta]"
+}
+
+function commonFields(event: TraceRequestEvent, info: PendingRequest): Record<string, unknown> {
+  return {
+    _id: info.id,
+    _purpose: info.purpose,
+    _url: info.url,
+    _flow: event.kind,
+    _agent: event.agent,
+    _model: modelLabel(event.model),
+  }
+}
+
+function nextID(session: string): number {
+  const seq = (ids.get(session) ?? 0) + 1
+  ids.set(session, seq)
+  return seq
+}
+
+function pendingKey(session: string, kind: RequestKind, method: string, url: string): string {
+  return `${session}\n${kind}\n${method}\n${url}`
+}
+
+function rememberRequest(request: Request, info: PendingRequest): void {
+  pendingRequests.set(request, info)
+  const key = pendingKey(info.sessionID, info.kind, info.method, info.url)
+  const queue = pendingQueues.get(key)
+  if (!queue) {
+    pendingQueues.set(key, [info])
+    return
+  }
+  queue.push(info)
+  if (queue.length > 100) queue.shift()
+}
+
+function forgetQueued(info: PendingRequest): void {
+  const key = pendingKey(info.sessionID, info.kind, info.method, info.url)
+  const queue = pendingQueues.get(key)
+  if (!queue) return
+  const index = queue.indexOf(info)
+  if (index !== -1) queue.splice(index, 1)
+  if (queue.length === 0) pendingQueues.delete(key)
+}
+
+function recallRequest(event: TraceResponseEvent): PendingRequest | undefined {
+  const exact = pendingRequests.get(event.request)
+  if (exact) {
+    pendingRequests.delete(event.request)
+    forgetQueued(exact)
+    return exact
+  }
+  const key = pendingKey(event.sessionID, event.kind, event.request.method, event.request.url)
+  const queue = pendingQueues.get(key)
+  const info = queue?.shift()
+  if (queue && queue.length === 0) pendingQueues.delete(key)
+  return info
+}
+
+function responseOnlyInfo(event: TraceResponseEvent): PendingRequest {
+  return {
+    id: nextID(event.sessionID),
+    sessionID: event.sessionID,
+    kind: event.kind,
+    method: event.request.method,
+    url: event.request.url,
+    purpose: purposeFor(event.kind),
+    name: fileName(undefined, event.sessionID),
+  }
+}
+
+/**
+ * Logs the outgoing LLM request row.
+ * Side effects: mutates `prevs`, `ids`, `pendingRequests`, `pendingQueues`, and writes logs to disk.
+ */
+async function traceRequest(event: TraceRequestEvent): Promise<void> {
+  try {
+    const request = event.request
+    const info: PendingRequest = {
+      id: nextID(event.sessionID),
+      sessionID: event.sessionID,
+      kind: event.kind,
+      method: request.method,
+      url: request.url,
+      purpose: purposeFor(event.kind),
+      name: fileName(undefined, event.sessionID),
+    }
+    rememberRequest(request, info)
+
+    let text = ""
+    try {
+      text = await request.clone().text()
+    } catch {
+      // A body that cannot be cloned is still logged as an empty body.
+    }
+    const raw = ((): Record<string, unknown> => {
+      try {
+        const body = JSON.parse(text) as unknown
+        return isRecord(body) ? body : { _body: text }
+      } catch {
+        return { _body: text }
+      }
+    })()
+    const title = typeof raw._body !== "string" ? extractPromptFromRequestBody(raw) : undefined
+    info.name = fileName(title, event.sessionID)
+
+    const requestKey = `${event.sessionID}\n${event.kind}\n${request.method}\n${request.url}\nrequest\n${info.purpose}`
+    const requestNext = raw as object
+    const [requestRow] = delta(prevs.get(requestKey), requestNext)
+    prevs.set(requestKey, requestNext)
+    writeNoThrow(event.sessionID, info.name, {
+      ...(requestRow as Record<string, unknown>),
+      ...commonFields(event, info),
+      _kind: "request",
+      _ts: timestamp(),
+    })
+  } catch {
+    // Intentionally swallow tracing failures so plugin logging can't break the LLM request.
+  }
+}
+
+/**
+ * Logs the incoming LLM response row. The response stream is cloned and read in the background,
+ * so OpenCode can start consuming the original response immediately.
+ * Side effects: mutates `prevs`, `pendingRequests`, `pendingQueues`, and writes logs to disk.
+ */
+function traceResponse(event: TraceResponseEvent): void {
+  try {
+    const response = event.response
+    const info = recallRequest(event) ?? responseOnlyInfo(event)
+    const common = commonFields(event, info)
+    const body = response.clone().text()
+    void body
+      .then((text) => {
+        try {
+          const json = responseAsJson(text, info.url)
+          const detail = isRecord(json) && isRecord(json.error) && typeof json.error.message === "string"
+            ? json.error.message
+            : isRecord(json) && typeof json.error === "string"
+              ? json.error
+              : `${response.status} ${response.statusText}`
+          const responseNext = (!response.ok
+            ? { ...json, _status: response.status, _status_text: response.statusText, _error: detail }
+            : json) as object
+          const responseKey = `${info.sessionID}\n${event.kind}\n${info.method}\n${info.url}\nresponse\n${info.purpose}`
+          const [responseRow] = delta(prevs.get(responseKey), responseNext)
+          prevs.set(responseKey, responseNext)
+          writeNoThrow(info.sessionID, info.name, {
+            ...(responseRow as Record<string, unknown>),
+            ...common,
+            _kind: "response",
+            _ts: timestamp(),
+          })
+        } catch {
+          // Intentionally swallow tracing failures so plugin logging can't break the LLM response.
+        }
+      })
+      .catch((err: unknown) => {
+        writeNoThrow(info.sessionID, info.name, {
+          ...common,
+          _kind: "error",
+          _ts: timestamp(),
+          ...errorRow(err),
+        })
+      })
+  } catch {
+    // Intentionally swallow tracing failures so plugin logging can't break the LLM response.
+  }
+}
+
+/** OpenCode V2 plugin entrypoint. */
+export default Plugin.define({
+  id: "rmkarasev.opencode-trace",
+  async setup(ctx): Promise<() => Promise<void>> {
+    const requestHook = await ctx.session.hook("http.request", traceRequest)
+    try {
+      const responseHook = await ctx.session.hook("http.response", traceResponse)
+      return async (): Promise<void> => {
+        await requestHook.dispose()
+        await responseHook.dispose()
+      }
+    } catch (err) {
+      await requestHook.dispose()
+      throw err
+    }
+  },
+})
